@@ -1,0 +1,163 @@
+To create a Lambda function that accesses MS SQL Server credentials from AWS Secrets Manager, you'll need to follow these steps:
+
+Create a secret in AWS Secrets Manager:
+
+Store your MS SQL Server credentials in Secrets Manager. The secret should be in the format:
+json
+Copy code
+{
+  "username": "your_username",
+  "password": "your_password",
+  "host": "your_host",
+  "database": "your_database"
+}
+Create a Lambda function:
+
+Use the AWS Lambda console or the AWS CLI to create a new Lambda function.
+Add the necessary permissions for the Lambda function to access AWS Secrets Manager.
+Write the Lambda function code:
+
+Use the AWS SDK for Python (Boto3) to access the secret and the pyodbc library to connect to MS SQL Server.
+Here is an example of a Lambda function written in Python:
+
+1. Install required dependencies
+First, ensure you have the boto3 and pyodbc libraries. Since Lambda has limited packages pre-installed, you might need to create a deployment package that includes these libraries.
+
+2. Lambda function code
+python
+Copy code
+import json
+import boto3
+import pyodbc
+import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def get_secret(secret_name):
+    """
+    Retrieve secret from AWS Secrets Manager
+    """
+    # Create a Secrets Manager client
+    client = boto3.client('secretsmanager')
+    
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+    except Exception as e:
+        logger.error(f"Error retrieving secret: {e}")
+        raise e
+    
+    secret = get_secret_value_response['SecretString']
+    return json.loads(secret)
+
+def connect_to_mssql(secret):
+    """
+    Connect to MS SQL Server using credentials from Secrets Manager
+    """
+    try:
+        connection = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={secret['host']};"
+            f"DATABASE={secret['database']};"
+            f"UID={secret['username']};"
+            f"PWD={secret['password']}"
+        )
+        return connection
+    except Exception as e:
+        logger.error(f"Error connecting to MS SQL Server: {e}")
+        raise e
+
+def lambda_handler(event, context):
+    """
+    Lambda function handler
+    """
+    secret_name = "your_secret_name"
+    
+    try:
+        secret = get_secret(secret_name)
+        connection = connect_to_mssql(secret)
+        
+        # Example query execution
+        cursor = connection.cursor()
+        cursor.execute("SELECT @@VERSION;")
+        row = cursor.fetchone()
+        
+        logger.info(f"Database version: {row[0]}")
+        
+        # Close the connection
+        cursor.close()
+        connection.close()
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps(f"Database version: {row[0]}")
+        }
+    except Exception as e:
+        logger.error(f"Error in lambda_handler: {e}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Error: {e}")
+        }
+3. Package the Lambda function
+Since pyodbc and its dependencies are not included in the AWS Lambda execution environment, you will need to package your Lambda function with these dependencies.
+
+Create a directory for your Lambda function:
+
+bash
+Copy code
+mkdir my_lambda_function
+cd my_lambda_function
+Create a requirements.txt file:
+
+text
+Copy code
+boto3
+pyodbc
+Install the dependencies in a python folder within the directory:
+
+bash
+Copy code
+pip install -r requirements.txt -t python/
+Add your Lambda function code to the directory:
+
+bash
+Copy code
+cp path_to_your_lambda_function.py .
+Zip the contents of the directory:
+
+bash
+Copy code
+zip -r my_lambda_function.zip .
+Upload the zip file to AWS Lambda:
+
+Go to the AWS Lambda console.
+Create a new Lambda function or update an existing one.
+Upload the my_lambda_function.zip file.
+4. Add permissions to access Secrets Manager
+Make sure your Lambda function has the necessary IAM permissions to access Secrets Manager. You can attach the following policy to the Lambda execution role:
+
+json
+Copy code
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "secretsmanager:GetSecretValue"
+            ],
+            "Resource": [
+                "arn:aws:secretsmanager:region:account-id:secret:your_secret_name"
+            ]
+        }
+    ]
+}
+Replace region, account-id, and your_secret_name with your specific values.
+
+This setup should allow your Lambda function to securely access MS SQL Server credentials from AWS Secrets Manager and use them to connect to your database.
+
+
+
+
+
+
