@@ -1,0 +1,432 @@
+import boto3
+import json
+import logging
+import os
+import pymssql
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+
+def lambda_handler(event, context):
+    """Secrets Manager RDS MSSQL Handler
+
+    This handler uses the single-user rotation scheme to rotate an RDS MSSQL user credential. This rotation scheme
+    logs into the database as the user and rotates the user's own password, immediately invalidating the user's
+    previous password.
+
+    The Secret SecretString is expected to be a JSON string with the following format:
+    {
+        'engine': <required: must be set to 'mssql'>,
+        'host': <required: instance host name>,
+        'username': <required: username>,
+        'password': <required: password>,
+        'dbname': <optional: database name>,
+        'port': <optional: if not specified, default port 1433 will be used>
+    }
+
+    Args:
+        event (dict): Lambda dictionary of event parameters. These keys must include the following:
+            - SecretId: The secret ARN or identifier
+            - ClientRequestToken: The ClientRequestToken of the secret version
+            - Step: The rotation step (one of createSecret, setSecret, testSecret, or finishSecret)
+
+        context (LambdaContext): The Lambda runtime information
+
+    Raises:
+        ResourceNotFoundException: If the secret with the specified arn and stage does not exist
+
+        ValueError: If the secret is not properly configured for rotation
+
+        KeyError: If the secret json does not contain the expected keys
+
+    """
+    arn = event["SecretId"]
+    token = event["ClientRequestToken"]
+    step = event["Step"]
+
+    # Setup the client
+    service_client = boto3.client(
+        "secretsmanager", endpoint_url=os.environ.get("SECRETS_MANAGER_ENDPOINT")
+    )
+
+    # Make sure the version is staged correctly
+    metadata = service_client.describe_secret(SecretId=arn)
+    if "RotationEnabled" in metadata and not metadata["RotationEnabled"]:
+        logger.error("Secret %s is not enabled for rotation" % arn)
+        raise ValueError("Secret %s is not enabled for rotation" % arn)
+    versions = metadata["VersionIdsToStages"]
+    if token not in versions:
+        logger.error(
+            "Secret version %s has no stage for rotation of secret %s." % (token, arn)
+        )
+        raise ValueError(
+            "Secret version %s has no stage for rotation of secret %s." % (token, arn)
+        )
+    if "AWSCURRENT" in versions[token]:
+        logger.info(
+            "Secret version %s already set as AWSCURRENT for secret %s." % (token, arn)
+        )
+        return
+    elif "AWSPENDING" not in versions[token]:
+        logger.error(
+            "Secret version %s not set as AWSPENDING for rotation of secret %s."
+            % (token, arn)
+        )
+        raise ValueError(
+            "Secret version %s not set as AWSPENDING for rotation of secret %s."
+            % (token, arn)
+        )
+
+    # Call the appropriate step
+    if step == "createSecret":
+        create_secret(service_client, arn, token)
+
+    elif step == "setSecret":
+        set_secret(service_client, arn, token)
+
+    elif step == "testSecret":
+        test_secret(service_client, arn, token)
+
+    elif step == "finishSecret":
+        finish_secret(service_client, arn, token)
+
+    else:
+        logger.error(
+            "lambda_handler: Invalid step parameter %s for secret %s" % (step, arn)
+        )
+        raise ValueError("Invalid step parameter %s for secret %s" % (step, arn))
+
+
+def create_secret(service_client, arn, token):
+    """Generate a new secret
+
+    This method first checks for the existence of a secret for the passed in token. If one does not exist, it will generate a
+    new secret and put it with the passed in token.
+
+    Args:
+        service_client (client): The secrets manager service client
+
+        arn (string): The secret ARN or other identifier
+
+        token (string): The ClientRequestToken associated with the secret version
+
+    Raises:
+        ValueError: If the current secret is not valid JSON
+
+        KeyError: If the secret json does not contain the expected keys
+
+    """
+    # Make sure the current secret exists
+    current_dict = get_secret_dict(service_client, arn, "AWSCURRENT")
+
+    # Now try to get the secret version, if that fails, put a new secret
+    try:
+        get_secret_dict(service_client, arn, "AWSPENDING", token)
+        logger.info("createSecret: Successfully retrieved secret for %s." % arn)
+    except service_client.exceptions.ResourceNotFoundException:
+        # Generate a random password
+        current_dict["password"] = get_random_password(service_client)
+
+        # Put the secret
+        service_client.put_secret_value(
+            SecretId=arn,
+            ClientRequestToken=token,
+            SecretString=json.dumps(current_dict),
+            VersionStages=["AWSPENDING"],
+        )
+        logger.info(
+            "createSecret: Successfully put secret for ARN %s and version %s."
+            % (arn, token)
+        )
+
+
+def set_secret(service_client, arn, token):
+    """Set the pending secret in the database
+
+    This method tries to login to the database with the AWSPENDING secret and returns on success. If that fails, it
+    tries to login with the AWSCURRENT and AWSPREVIOUS secrets. If either one succeeds, it sets the AWSPENDING password
+    as the user password in the database. Else, it throws a ValueError.
+
+    Args:
+        service_client (client): The secrets manager service client
+
+        arn (string): The secret ARN or other identifier
+
+        token (string): The ClientRequestToken associated with the secret version
+
+    Raises:
+        ResourceNotFoundException: If the secret with the specified arn and stage does not exist
+
+        ValueError: If the secret is not valid JSON or valid credentials are found to login to the database
+
+        KeyError: If the secret json does not contain the expected keys
+
+    """
+    try:
+        previous_dict = get_secret_dict(service_client, arn, "AWSPREVIOUS")
+    except (service_client.exceptions.ResourceNotFoundException, KeyError):
+        previous_dict = None
+    current_dict = get_secret_dict(service_client, arn, "AWSCURRENT")
+    pending_dict = get_secret_dict(service_client, arn, "AWSPENDING", token)
+
+    # First try to login with the pending secret, if it succeeds, return
+    conn = get_connection(pending_dict)
+    if conn:
+        conn.close()
+        logger.info(
+            "setSecret: AWSPENDING secret is already set as password in MSSQL DB for secret arn %s."
+            % arn
+        )
+        return
+
+    # Make sure the user from current and pending match
+    if current_dict["username"] != pending_dict["username"]:
+        logger.error(
+            "setSecret: Attempting to modify user %s other than current user %s"
+            % (pending_dict["username"], current_dict["username"])
+        )
+        raise ValueError(
+            "Attempting to modify user %s other than current user %s"
+            % (pending_dict["username"], current_dict["username"])
+        )
+
+    # Make sure the host from current and pending match
+    if current_dict["host"] != pending_dict["host"]:
+        logger.error(
+            "setSecret: Attempting to modify user for host %s other than current host %s"
+            % (pending_dict["host"], current_dict["host"])
+        )
+        raise ValueError(
+            "Attempting to modify user for host %s other than current host %s"
+            % (pending_dict["host"], current_dict["host"])
+        )
+
+    # Now try the current password
+    conn = get_connection(current_dict)
+
+    # If both current and pending do not work, try previous
+    if not conn and previous_dict:
+
+        conn = get_connection(previous_dict)
+
+        # Make sure the user/host from previous and pending match
+        if previous_dict["username"] != pending_dict["username"]:
+            logger.error(
+                "setSecret: Attempting to modify user %s other than previous valid user %s"
+                % (pending_dict["username"], previous_dict["username"])
+            )
+            raise ValueError(
+                "Attempting to modify user %s other than previous valid user %s"
+                % (pending_dict["username"], previous_dict["username"])
+            )
+        if previous_dict["host"] != pending_dict["host"]:
+            logger.error(
+                "setSecret: Attempting to modify user for host %s other than previous host %s"
+                % (pending_dict["host"], previous_dict["host"])
+            )
+            raise ValueError(
+                "Attempting to modify user for host %s other than previous host %s"
+                % (pending_dict["host"], previous_dict["host"])
+            )
+
+    # If we still don't have a connection, raise a ValueError
+    if not conn:
+        logger.error(
+            "setSecret: Unable to log into database with previous, current, or pending secret of secret arn %s"
+            % arn
+        )
+        raise ValueError(
+            "Unable to log into database with previous, current, or pending secret of secret arn %s"
+            % arn
+        )
+
+    # Now set the password to the pending password
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"ALTER LOGIN {pending_dict['username']} WITH PASSWORD = '{pending_dict['password']}'"
+            )
+
+            conn.commit()
+            logger.info(
+                "setSecret: Successfully set password for user %s in MSSQL DB for secret arn %s."
+                % (pending_dict["username"], arn)
+            )
+    finally:
+        conn.close()
+
+
+def test_secret(service_client, arn, token):
+    """Test the pending secret in the database
+
+    This method tries to login to the database with the AWSPENDING secret.
+
+
+    Args:
+        service_client (client): The secrets manager service client
+
+        arn (string): The secret ARN or other identifier
+
+        token (string): The ClientRequestToken associated with the secret version
+
+    Raises:
+        ResourceNotFoundException: If the secret with the specified arn and stage does not exist
+
+        ValueError: If the secret is not valid JSON or valid credentials are found to login to the database
+
+        KeyError: If the secret json does not contain the expected keys
+
+    """
+    # Try to login with the pending secret, if it succeeds, return
+    pending_dict = get_secret_dict(service_client, arn, "AWSPENDING", token)
+    conn = get_connection(pending_dict)
+    if conn:
+        conn.close()
+        logger.info(
+            "testSecret: Successfully signed into MSSQL DB with AWSPENDING secret in %s."
+            % arn
+        )
+        return
+
+    logger.error(
+        "testSecret: Unable to log into database with pending secret of secret ARN %s"
+        % arn
+    )
+    raise ValueError(
+        "Unable to log into database with pending secret of secret ARN %s" % arn
+    )
+
+
+def finish_secret(service_client, arn, token):
+    """Finish the secret rotation by marking the pending secret as current
+
+    This method marks the secret version denoted by the ClientRequestToken as the AWSCURRENT secret.
+
+    Args:
+        service_client (client): The secrets manager service client
+
+        arn (string): The secret ARN or other identifier
+
+        token (string): The ClientRequestToken associated with the secret version
+
+    """
+    # First describe the secret to get the current version
+    metadata = service_client.describe_secret(SecretId=arn)
+    current_version = None
+    for version in metadata["VersionIdsToStages"]:
+        if "AWSCURRENT" in metadata["VersionIdsToStages"][version]:
+
+            current_version = version
+            break
+
+    # Finalize by staging the secret version current
+    service_client.update_secret_version_stage(
+        SecretId=arn,
+        VersionStage="AWSCURRENT",
+        MoveToVersionId=token,
+        RemoveFromVersionId=current_version,
+    )
+    logger.info(
+        "finishSecret: Successfully set AWSCURRENT stage to version %s for secret %s."
+        % (token, arn)
+    )
+
+
+def get_connection(secret_dict):
+    """Gets a connection to MSSQL DB from a secret dictionary
+
+    This helper function gets a connection to the MSSQL DB from a secret dictionary. If the connection fails, it returns
+    None.
+
+
+    Args:
+        secret_dict (dict): The Secret Dictionary
+
+    Returns:
+        connection: Connection to the MSSQL DB
+
+    Raises:
+        KeyError: If the secret json does not contain the expected keys
+
+    """
+
+    port = int(secret_dict["port"]) if "port" in secret_dict else 1433
+
+    try:
+        conn = pymssql.connect(
+            server=secret_dict["host"],
+            user=secret_dict["username"],
+            password=secret_dict["password"],
+            database=secret_dict["dbname"] if "dbname" in secret_dict else None,
+            port=port,
+        )
+        return conn
+    except pymssql.OperationalError:
+
+        return None
+
+
+def get_secret_dict(service_client, arn, stage, token=None):
+    """Gets the secret dictionary corresponding to the secret arn, stage, and token
+
+    This helper function gets the secret dictionary corresponding to the secret arn, stage, and token.
+
+    Args:
+        service_client (client): The secrets manager service client
+
+        arn (string): The secret ARN or other identifier
+
+        stage (string): The stage identifying the secret version
+
+        token (string): The ClientRequestToken associated with the secret version (optional)
+
+    Returns:
+        dict: Secret dictionary
+
+    Raises:
+        ResourceNotFoundException: If the secret with the specified arn and stage does not exist
+
+        ValueError: If the secret is not valid JSON
+
+        KeyError: If the secret json does not contain the expected keys
+
+    """
+    required_fields = ["host", "username", "password"]
+
+    if token:
+        secret = service_client.get_secret_value(
+            SecretId=arn, VersionId=token, VersionStage=stage
+        )
+    else:
+        secret = service_client.get_secret_value(SecretId=arn, VersionStage=stage)
+    plaintext = secret["SecretString"]
+    secret_dict = json.loads(plaintext)
+
+    # Run validations to make sure all required fields are present
+
+    for field in required_fields:
+        if field not in secret_dict:
+            raise KeyError("%s key is missing from secret JSON" % field)
+
+    return secret_dict
+
+
+def get_random_password(service_client):
+    """Generate a random password
+
+
+    This helper function generates a random password of the specified complexity.
+
+    Args:
+        service_client (client): The secrets manager service client
+
+    Returns:
+        string: Randomized password
+
+    """
+    passwd = service_client.get_random_password(
+        ExcludeCharacters="/@\"'\\", PasswordLength=30
+    )
+
+    return passwd["RandomPassword"]
